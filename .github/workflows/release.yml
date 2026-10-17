@@ -1,0 +1,163 @@
+# Mirror repository workflow for third-party signing requests.
+#
+# Lives in the mirror repository (ours), not in the third party's repository.
+# It is started by ossign-server when a dispatch client requests a signing:
+#   POST /api/v1/dispatch/<client>  { "ref": "v1.2.3" }
+# The server resolves the ref to a commit, starts the review, and triggers this
+# workflow with the inputs below. The sign job runs in an environment that is
+# protected by the OSSign deployment protection rule and is released only when
+# the review is approved.
+#
+# Every block is marked:
+#   [REQUIRED]  the server or the review depends on it; keep it as is
+#   [ADAPT]     project specific; replace freely
+#   [OPTIONAL]  can be removed without affecting the server
+
+name: Sign release
+
+# [REQUIRED] The server finds the run of a dispatch through this title. Keep the
+# "[<dispatch_id>]" part exactly; the text before it is free.
+run-name: "Sign ${{ inputs.ref }} [${{ inputs.dispatch_id }}]"
+
+# [REQUIRED] These four inputs are what the server passes on workflow_dispatch.
+# Add more if you want, never rename or drop these.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag of the source repository as requested
+        required: true
+      sha:
+        description: Commit pinned by ossign-server; the build uses this, never the moving ref
+        required: true
+      release_name:
+        description: Name of the GitHub release to publish
+        required: true
+      dispatch_id:
+        description: Dispatch id assigned by ossign-server
+        required: true
+
+env:
+  # [ADAPT] Must equal the environment rule's sourceRepository.
+  SOURCE_REPO: https://github.com/v3-nu/vvv
+  # [ADAPT] Your ossign-server.
+  OSSIGN_SERVER: https://signer.ossign.org
+  # [ADAPT] Key name on the server this mirror repository signs with.
+  OSSIGN_KEY: azartifact
+
+# [REQUIRED] id-token: write gives the jobs their OIDC token (uploads and signing).
+# contents: write is only needed by the release step at the bottom.
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # prepare: static checks on the pinned commit, uploaded to the review before
+  # the gate. [REQUIRED] as a whole when the review rule has a scanner step
+  # (the default requires gitleaks and osv-scanner); without a scanner step the
+  # whole job is [OPTIONAL].
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      # [REQUIRED] Check out the pinned SHA, never the ref. The last line fails
+      # the job if the fetch did not return exactly the pinned commit.
+      - name: Check out the pinned source commit
+        run: |
+          git init src
+          cd src
+          git remote add origin "$SOURCE_REPO"
+          git fetch --depth 1 origin "${{ inputs.sha }}"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${{ inputs.sha }}"
+
+      # [ADAPT] Scanners. Versions can be bumped, tools can be added as long as
+      # every tool the rule's scanner step lists under "require" produces a
+      # report below. Supported report formats: gitleaks, osv-scanner, semgrep
+      # and trivy JSON, or any tool's SARIF with format "sarif".
+      - name: gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz gitleaks
+          ./gitleaks dir src --report-format json --report-path gitleaks.json --exit-code 0 --no-banner
+          test -s gitleaks.json || echo '[]' > gitleaks.json
+
+      - name: osv-scanner
+        run: |
+          curl -sSL -o osv-scanner https://github.com/google/osv-scanner/releases/download/v1.9.1/osv-scanner_linux_amd64
+          chmod +x osv-scanner
+          ./osv-scanner scan --recursive --format json --output osv.json src || true
+          test -s osv.json || echo '{"results":[]}' > osv.json
+
+      # [REQUIRED] Upload the reports with the job's OIDC token. Extend the
+      # uploads list when you add a scanner; keep the sha and the URL.
+      - name: Upload scanner reports to the review
+        run: |
+          OIDC=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OSSIGN_SERVER" | jq -r .value)
+          jq -n --arg sha "${{ inputs.sha }}" \
+                --rawfile gitleaks gitleaks.json --rawfile osv osv.json \
+                '{sha: $sha, uploads: [
+                   {tool: "gitleaks",    format: "json", content: $gitleaks},
+                   {tool: "osv-scanner", format: "json", content: $osv}]}' > uploads.json
+          curl -sS --fail -X POST -H "Authorization: Bearer $OIDC" -H "Content-Type: application/json" \
+            --data @uploads.json "$OSSIGN_SERVER/api/v1/reviews/${{ inputs.dispatch_id }}/uploads"
+
+  # ---------------------------------------------------------------------------
+  # sign: builds and signs. Blocked by the deployment protection rule until the
+  # review is approved.
+  # ---------------------------------------------------------------------------
+  sign:
+    needs: prepare                # [REQUIRED] when prepare exists: uploads must land before the gate
+    runs-on: ubuntu-latest        # [ADAPT] windows-latest works too; the ossign action supports all three
+    environment: signing          # [REQUIRED] the environment the OSSign protection rule is enabled on
+    steps:
+      # [REQUIRED] Same pinned checkout as above. Whatever gets signed must be
+      # built from this commit, because this is the commit that was reviewed.
+      - name: Check out the pinned source commit
+        run: |
+          git init src
+          cd src
+          git remote add origin "$SOURCE_REPO"
+          git fetch --depth 1 origin "${{ inputs.sha }}"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${{ inputs.sha }}"
+
+      # [ADAPT] Toolchain and build. Anything goes, as long as the outputs end
+      # up in dist/ for the steps below. Example: a Go project producing two
+      # executables.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      
+      - name: Install OSSign
+        uses: ossign/ossign-action@v1
+        with:
+          installOnly: true
+          config: |
+            { "tokenType": "ossignServer",
+              "ossignServer": { "url": "${{ env.OSSIGN_SERVER }}", "key": "${{ env.OSSIGN_KEY }}",
+                                "metadata": { "dispatch": "${{ inputs.dispatch_id }}", "sha": "${{ inputs.sha }}" } } }
+
+      - name: Goreleaser
+        uses: goreleaser/goreleaser-action@v2
+        with:
+          version: ${{ github.event.release.tag.name }}
+          args: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SKIP_PACKAGES: "yes"
+
+      # [OPTIONAL] Publish. The dispatch status endpoint reports the assets of
+      # the latest release to the third party, so if you publish elsewhere
+      # (S3, a package feed) the third party gets no asset list from the
+      # server and must fetch from your location instead.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.ref }}-${{ github.run_number }}
+          name: ${{ inputs.release_name }}
+          body: "Signed build of ${{ env.SOURCE_REPO }} at ${{ inputs.sha }} (ref ${{ inputs.ref }})."
+          files: |
+            dist/*-signed.exe
+            dist/*-signed.msi
